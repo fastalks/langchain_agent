@@ -14,8 +14,6 @@ services:
 
     environment:
       - TZ=Asia/Shanghai  # ✅ 设置时区为东八区
-    depends_on:
-      - fastapi-admin
     restart: unless-stopped
     networks:
       - gongzhonghao-network
