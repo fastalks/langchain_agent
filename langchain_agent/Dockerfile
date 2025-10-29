@@ -1,7 +1,7 @@
 # Dockerfile
 
 # 使用官方 Python 轻量镜像
-FROM python:3.11-slim
+FROM python:3.9-slim
 
 # 设置工作目录
 WORKDIR /app
