@@ -1,22 +1,22 @@
 version: '3.8'
 
 services:
-  nginx:
-    image: nginx:alpine
-    container_name: admin-nginx
-    ports:
-      - "80:80"
-    volumes:
-      - ./docker_env/nginx:/etc/nginx/conf.d
-      - ./docker_env/nginx/html/dist:/usr/share/nginx/html
-      - ./docker_env/nginx/50x.html:/usr/share/nginx/html/50x.html
-      - ./docker_env/admin/static/images:/usr/share/nginx/html/static/images:ro
+  # nginx:
+  #   image: nginx:alpine
+  #   container_name: agent-nginx
+  #   ports:
+  #     - "80:80"
+  #   volumes:
+  #     - ./docker_env/nginx:/etc/nginx/conf.d
+  #     - ./docker_env/nginx/html/dist:/usr/share/nginx/html
+  #     - ./docker_env/nginx/50x.html:/usr/share/nginx/html/50x.html
+  #     - ./docker_env/admin/static/images:/usr/share/nginx/html/static/images:ro
 
-    environment:
-      - TZ=Asia/Shanghai  # ✅ 设置时区为东八区
-    restart: unless-stopped
-    networks:
-      - gongzhonghao-network
+  #   environment:
+  #     - TZ=Asia/Shanghai  # ✅ 设置时区为东八区
+  #   restart: unless-stopped
+  #   networks:
+  #     - gongzhonghao-network
 
   qdrant:  # 向量数据库
     image: qdrant/qdrant:latest
@@ -39,6 +39,7 @@ services:
       - gongzhonghao-network
 
   langchain_agent:
+    env_file: .env
     build:
       context: ./langchain_agent
       dockerfile: Dockerfile
