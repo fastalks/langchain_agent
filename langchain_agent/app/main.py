@@ -737,6 +737,151 @@ async def upload_image():
     """
     return {"message": "图片上传功能开发中，敬请期待！"}
 
+# 测试接口：从外部API获取动漫列表并存入向量数据库
+@app.post("/api/anime/sync-from-external", response_model=UploadResponse)
+async def sync_anime_from_external():
+    """
+    测试接口：从外部API (http://localhost:8080/api/anime/list) 获取动漫列表并存入向量数据库
+    """
+    import httpx
+    import uuid
+    
+    try:
+        # 1. 从外部API获取动漫列表
+        external_api_url = "http://host.docker.internal:8080/api/anime/list"
+        
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            response = await client.get(external_api_url)
+            response.raise_for_status()
+            
+        api_response = response.json()
+        print(api_response)
+        # 2. 检查响应格式
+        if api_response.get("code") != 0:
+            raise HTTPException(
+                status_code=400, 
+                detail=f"外部API返回错误: {api_response.get('msg', '未知错误')}"
+            )
+        
+        anime_list = api_response.get("data", {}).get("animes", [])
+        if not anime_list:
+            return {
+                "success": True,
+                "message": "外部API返回空动漫列表",
+                "count": 0
+            }
+        
+        # 3. 转换数据格式到本地模型
+        converted_animes = []
+        for anime_data in anime_list:
+            # 确保每个动漫都有UUID
+            anime_uuid = anime_data.get("id")
+            if not anime_uuid:
+                anime_uuid = str(uuid.uuid4())
+            
+            # 映射外部API数据到本地AnimeData模型
+            converted_anime = {
+                # 主键和标识
+                "id": anime_uuid,
+                "uuid": anime_uuid,
+                "anilist_id": anime_data.get("anilist_id"),
+                "mal_id": anime_data.get("mal_id"),  
+                "bangumi_id": anime_data.get("bangumi_id"),
+                
+                # 标题映射
+                "title_zh": anime_data.get("title_zh") or anime_data.get("name_cn"),
+                "title_en": anime_data.get("title_en") or anime_data.get("name"),
+                "title_jp": anime_data.get("title_jp"),
+                "title_romaji": anime_data.get("title_romaji"),
+                
+                # 兼容字段
+                "name_cn": anime_data.get("name_cn") or anime_data.get("title_zh"),
+                "name": anime_data.get("name") or anime_data.get("title_en"),
+                
+                # 简介
+                "description_zh": anime_data.get("description_zh") or anime_data.get("description"),
+                "description_en": anime_data.get("description_en"),
+                "description": anime_data.get("description"),
+                
+                # 媒体信息
+                "media_type": anime_data.get("media_type") or anime_data.get("format") or anime_data.get("type"),
+                "format": anime_data.get("format") or anime_data.get("media_type"),
+                "type": anime_data.get("type") or anime_data.get("media_type"),
+                "status": anime_data.get("status"),
+                
+                # 播出信息
+                "episodes": anime_data.get("episodes"),
+                "duration": anime_data.get("duration"),
+                "year": anime_data.get("year") or anime_data.get("season_year") or anime_data.get("release_year"),
+                "season": anime_data.get("season"),
+                "season_year": anime_data.get("season_year") or anime_data.get("year"),
+                "release_year": anime_data.get("release_year") or anime_data.get("year"),
+                
+                # 评分信息
+                "average_score": anime_data.get("average_score") or anime_data.get("mean_score"),
+                "mean_score": anime_data.get("mean_score") or anime_data.get("average_score"),
+                "rating": anime_data.get("rating") or anime_data.get("average_score"),
+                "popularity": anime_data.get("popularity"),
+                "favourites": anime_data.get("favourites"),
+                
+                # 分类
+                "genres": anime_data.get("genres") or [],
+                "tags": anime_data.get("tags") or anime_data.get("genres") or [],
+                
+                # 制作信息
+                "studios_json": anime_data.get("studios_json"),
+                "studio": anime_data.get("studio"),
+                "source_type": anime_data.get("source_type"),
+                "country_of_origin": anime_data.get("country_of_origin", "JP"),
+                
+                # 图片信息
+                "image_large": anime_data.get('images').get("image_large"),
+                "image_medium": anime_data.get('images').get("image_medium"),
+                "image_small": anime_data.get('images').get("image_small"),
+                "image_grid": anime_data.get('images').get("image_grid"),
+                "image_common": anime_data.get('images').get("image_common"),
+                
+                # 兼容图片字段
+                "poster_url": anime_data.get("poster_url") or anime_data.get("cover_url"),
+                "cover_url": anime_data.get("cover_url") or anime_data.get("poster_url"),
+                "thumbnail_url": anime_data.get("thumbnail_url"),
+                "screenshots": anime_data.get("screenshots") or [],
+                
+                # 其他信息
+                "is_adult": anime_data.get("is_adult", False),
+                "data_source": anime_data.get("data_source", "external_api"),
+                "director": anime_data.get("director")
+            }
+            
+            converted_animes.append(converted_anime)
+        
+        # 4. 批量存入向量数据库
+        if converted_animes:
+            works_data = prepare_works_for_langchain(converted_animes)
+            upload_to_qdrant_using_langchain(works_data)
+        
+        return {
+            "success": True,
+            "message": f"成功从外部API同步并存储 {len(converted_animes)} 条动漫数据",
+            "count": len(converted_animes)
+        }
+        
+    except httpx.RequestError as e:
+        raise HTTPException(
+            status_code=503, 
+            detail=f"无法连接到外部API ({external_api_url}): {str(e)}"
+        )
+    except httpx.HTTPStatusError as e:
+        raise HTTPException(
+            status_code=e.response.status_code,
+            detail=f"外部API返回错误状态码 {e.response.status_code}: {e.response.text}"
+        )
+    except Exception as e:
+        import traceback
+        error_trace = traceback.format_exc()
+        logger.error(f"同步外部动漫数据异常: {error_trace}")
+        raise HTTPException(status_code=500, detail=f"同步外部动漫数据失败：{str(e)}")
+
 
 # ==================== 新增流式API端点 ====================
 

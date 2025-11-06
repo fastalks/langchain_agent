@@ -178,26 +178,119 @@ async def answer_question(user_question: str, k: int = 3) -> str:
 async def get_formatted_recommendations(user_question: str, k: int = 3, base_url: str = "") -> dict:
     """
     返回格式化的推荐数据，包含完整的图片链接和结构化信息
+    增强版：支持tag和genre精准匹配
     """
     import time
     start_time = time.time()
     
     try:
-        # 1. 向量检索阶段
+        # 1. 向量检索阶段 + Tag匹配增强
         logger.info(f"开始格式化推荐查询: {user_question}")
         
         # 生成查询向量
         query_embedding = get_embedding(user_question)
         
-        # 执行向量搜索
+        # 先尝试标准向量搜索
         search_results = client.search(
             collection_name=collection_name,
             query_vector=query_embedding,
-            limit=k,
-            score_threshold=0.3
+            limit=k * 2,  # 获取更多结果以便后续过滤
+            score_threshold=0.2  # 降低阈值，获取更多候选
         )
         
-        if not search_results:
+        # 2. 增强搜索：tag、genre和年份匹配
+        enhanced_results = []
+        tag_boost_keywords = {
+            "动作": ["Action", "动作", "战斗", "打斗"],
+            "爱情": ["Romance", "爱情", "恋爱", "浪漫"],
+            "喜剧": ["Comedy", "喜剧", "搞笑", "幽默"],
+            "恐怖": ["Horror", "恐怖", "惊悚"],
+            "科幻": ["Sci-Fi", "科幻", "未来"],
+            "奇幻": ["Fantasy", "奇幻", "魔法"],
+            "冒险": ["Adventure", "冒险", "探险"],
+            "悬疑": ["Mystery", "悬疑", "推理"],
+            "热血": ["热血", "燃", "励志"],
+            "治愈": ["治愈", "温馨", "感人"],
+            "校园": ["校园", "学校", "青春"],
+            "运动": ["运动", "体育", "竞技"],
+            "音乐": ["音乐", "歌唱", "乐队"],
+            "历史": ["历史", "古代", "战国"]
+        }
+        
+        # 检查用户查询是否包含特定tag关键词
+        user_query_lower = user_question.lower()
+        matched_tags = []
+        for tag_cn, tag_variants in tag_boost_keywords.items():
+            for variant in tag_variants:
+                if variant.lower() in user_query_lower:
+                    matched_tags.extend(tag_variants)
+                    break
+        
+        # 检查年份匹配
+        import re
+        year_pattern = r'(19|20)\d{2}年?'
+        target_years = []
+        for match in re.finditer(year_pattern, user_question):
+            year_str = match.group()
+            # 提取数字年份
+            year_num = re.search(r'(19|20)\d{2}', year_str)
+            if year_num:
+                target_years.append(int(year_num.group()))
+        
+        logger.info(f"检测到目标年份: {target_years}" if target_years else "未检测到特定年份")
+        
+        # 对结果进行tag匹配和年份匹配评分
+        for result in search_results:
+            anime = result.payload
+            base_score = result.score
+            
+            # Tag匹配加分
+            tag_boost = 0.0
+            anime_tags = anime.get('tags', []) or []
+            anime_genres = anime.get('genres', []) or []
+            all_anime_tags = anime_tags + anime_genres
+            
+            if matched_tags and all_anime_tags:
+                # 计算tag匹配度
+                matches = 0
+                for tag in matched_tags:
+                    for anime_tag in all_anime_tags:
+                        if tag.lower() in str(anime_tag).lower():
+                            matches += 1
+                
+                if matches > 0:
+                    tag_boost = min(0.3, matches * 0.1)  # 最多加0.3分
+                    logger.info(f"Tag匹配加分: {anime.get('title_zh', '未知')} +{tag_boost:.2f}")
+            
+            # 年份匹配加分
+            year_boost = 0.0
+            anime_year = anime.get('year') or anime.get('season_year') or anime.get('release_year')
+            if target_years and anime_year:
+                if anime_year in target_years:
+                    year_boost = 0.5  # 年份精确匹配给予较高加分
+                    logger.info(f"年份匹配加分: {anime.get('title_zh', '未知')} ({anime_year}年) +{year_boost:.2f}")
+                elif any(abs(anime_year - target_year) <= 1 for target_year in target_years):
+                    year_boost = 0.2  # 相近年份给予小幅加分
+                    logger.info(f"年份相近加分: {anime.get('title_zh', '未知')} ({anime_year}年) +{year_boost:.2f}")
+            
+            # 计算最终评分
+            final_score = base_score + tag_boost + year_boost
+            
+            enhanced_results.append({
+                'payload': anime,
+                'score': final_score,
+                'original_score': base_score,
+                'tag_boost': tag_boost,
+                'year_boost': year_boost
+            })
+        
+        # 按最终评分重新排序
+        enhanced_results.sort(key=lambda x: x['score'], reverse=True)
+        
+        # 取前k个结果
+        final_results = enhanced_results[:k]
+        
+        if not final_results:
             return {
                 "answer": f"抱歉，没有找到与「{user_question}」相关的动漫作品。请尝试使用其他关键词搜索。",
                 "recommendations": [],
@@ -209,9 +302,11 @@ async def get_formatted_recommendations(user_question: str, k: int = 3, base_url
         formatted_recommendations = []
         context_parts = []
         
-        for result in search_results:
-            anime = result.payload
-            score = result.score
+        for result in final_results:
+            anime = result['payload']
+            score = result['score']
+            tag_boost = result.get('tag_boost', 0)
+            year_boost = result.get('year_boost', 0)
             
             # 构建图片链接
             def build_image_url(relative_path: str) -> str:
@@ -253,7 +348,7 @@ async def get_formatted_recommendations(user_question: str, k: int = 3, base_url
                 "rating": anime.get('rating'),
                 "popularity": anime.get('popularity'),
                 
-                # 分类
+                # 分类（重点显示匹配的tags）
                 "genres": anime.get('genres', []),
                 "tags": anime.get('tags', []),
                 
@@ -269,8 +364,10 @@ async def get_formatted_recommendations(user_question: str, k: int = 3, base_url
                 "studio": anime.get('studio'),
                 "source_type": anime.get('source_type'),
                 
-                # 匹配信息
+                # 匹配信息（包含tag和年份加分）
                 "match_score": round(score, 3),
+                "tag_boost": round(tag_boost, 3) if tag_boost > 0 else None,
+                "year_boost": round(year_boost, 3) if year_boost > 0 else None,
                 
                 # 兼容字段
                 "name_cn": anime.get('name_cn'),
@@ -284,25 +381,55 @@ async def get_formatted_recommendations(user_question: str, k: int = 3, base_url
             formatted_item = {k: v for k, v in formatted_item.items() if v is not None and v != [] and v != ""}
             formatted_recommendations.append(formatted_item)
             
-            # 为AI回答构建上下文
+            # 为AI回答构建上下文（突出匹配的tags）
             title = formatted_item.get('title_zh') or formatted_item.get('name_cn', '未知作品')
             description = formatted_item.get('description_zh') or '暂无简介'
             description = description[:100] if description else '暂无简介'
-            context_parts.append(f"《{title}》- {description}...")
+            
+            # 添加匹配的tag和年份信息到上下文
+            match_info = ""
+            if matched_tags and anime.get('tags'):
+                matched_anime_tags = []
+                for tag in matched_tags:
+                    for anime_tag in anime.get('tags', []):
+                        if tag.lower() in str(anime_tag).lower():
+                            matched_anime_tags.append(anime_tag)
+                if matched_anime_tags:
+                    match_info += f" [匹配标签: {', '.join(list(set(matched_anime_tags))[:3])}]"
+            
+            if year_boost > 0:
+                anime_year = anime.get('year') or anime.get('season_year') or anime.get('release_year')
+                match_info += f" [年份匹配: {anime_year}年]"
+            
+            context_parts.append(f"《{title}》- {description}...{match_info}")
         
-        # 3. 生成AI回答
+        # 3. 生成AI回答（包含tag匹配说明）
         context = "\n".join(context_parts)
         try:
+            # 构建增强的提示，突出tag和年份匹配
+            enhanced_prompt = f"用户问题：{user_question}\n"
+            if matched_tags:
+                enhanced_prompt += f"检测到的关键标签：{', '.join(set(matched_tags))}\n"
+            if target_years:
+                enhanced_prompt += f"检测到的目标年份：{', '.join(map(str, target_years))}年\n"
+            enhanced_prompt += f"推荐内容：\n{context}"
+            
             qwen_client = get_qwen_client()
             ai_response = await qwen_client.generate_response(
-                user_question=user_question,
+                user_question=enhanced_prompt,
                 context=context,
                 temperature=0.7,
                 max_tokens=800
             )
         except Exception as llm_error:
             logger.error(f"千问API调用失败: {llm_error}")
-            ai_response = f"🎌 根据您的问题「{user_question}」，为您找到了 {len(formatted_recommendations)} 部相关的动漫作品，详情请查看推荐列表。"
+            # 备用回答包含tag和年份匹配信息
+            match_info = ""
+            if matched_tags:
+                match_info += f"（基于标签匹配：{', '.join(set(matched_tags))}）"
+            if target_years:
+                match_info += f"（目标年份：{', '.join(map(str, target_years))}年）"
+            ai_response = f"🎌 根据您的问题「{user_question}」{match_info}，为您找到了 {len(formatted_recommendations)} 部相关的动漫作品，详情请查看推荐列表。"
         
         query_time = round(time.time() - start_time, 3)
         
@@ -310,7 +437,9 @@ async def get_formatted_recommendations(user_question: str, k: int = 3, base_url
             "answer": ai_response,
             "recommendations": formatted_recommendations,
             "total_found": len(formatted_recommendations),
-            "query_time": query_time
+            "query_time": query_time,
+            "tag_matched": matched_tags if matched_tags else None,  # 返回匹配的tags
+            "year_matched": target_years if target_years else None   # 返回匹配的年份
         }
         
     except Exception as e:
