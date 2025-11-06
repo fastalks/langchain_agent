@@ -1,22 +1,19 @@
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.staticfiles import StaticFiles
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, RedirectResponse, StreamingResponse
 from pydantic import BaseModel
-from typing import List, Optional, Dict
+from typing import List, Optional, Dict, AsyncGenerator
 import os
-from app.langchain_agent import answer_question, get_formatted_recommendations  # 导入新的推荐函数
+import json
+import asyncio
+import logging
+from app.langchain_agent import answer_question, get_formatted_recommendations, get_streaming_recommendations as get_anime_streaming_data  # 导入新的推荐函数
 from app.upload_to_qdrant import prepare_works_for_langchain, upload_to_qdrant_using_langchain
+from app.qwen_api import get_qwen_client
+
+logger = logging.getLogger(__name__)
 
 app = FastAPI(title="LangChain Anime Agent API", version="1.0")
-
-# 挂载静态文件服务（用于图片访问）
-# 确保 images 目录存在
-images_dir = "/app/images"
-if not os.path.exists(images_dir):
-    os.makedirs(images_dir, exist_ok=True)
-
-# 挂载静态文件
-app.mount("/images", StaticFiles(directory=images_dir), name="images")
 
 # 请求模型
 class QuestionRequest(BaseModel):
@@ -264,6 +261,82 @@ class FormattedRecommendationResponse(BaseModel):
             }
         }
 
+# 流式推荐响应模型
+class StreamingRecommendationResponse(BaseModel):
+    stream_answer: bool = True           # 是否需要打字机效果
+    answer_chunks: List[str] = []        # 分段的回答文本
+    answer_complete: Optional[str] = None # 完整回答（备用）
+    recommendations: List[FormattedAnimeItem] = []  # 完整推荐数据
+    total_found: int = 0
+    query_time: Optional[float] = None
+    
+    class Config:
+        schema_extra = {
+            "example": {
+                "stream_answer": True,
+                "answer_chunks": [
+                    "根据您的问题「推荐一些热血动漫」，",
+                    "我为您精心挑选了以下几部作品：",
+                    "\n\n🔥《火影忍者》- 经典的忍者成长故事...",
+                    "\n\n⚔️《鬼灭之刃》- 大正时代的猎鬼传说..."
+                ],
+                "recommendations": [
+                    {
+                        "title_zh": "火影忍者",
+                        "cover_image": "http://localhost:8000/images/covers/naruto.jpg",
+                        "average_score": 85.0,
+                        "match_score": 0.95
+                    }
+                ],
+                "total_found": 3,
+                "query_time": 1.234
+            }
+        }
+
+# 渐进式推荐项模型
+class ProgressiveItem(BaseModel):
+    type: str  # "intro", "anime", "conclusion"
+    text: str
+    anime: Optional[FormattedAnimeItem] = None
+    delay: float = 0.5  # 建议的显示延迟时间（秒）
+
+# 渐进式推荐响应模型
+class ProgressiveRecommendationResponse(BaseModel):
+    progressive_answer: bool = True
+    progressive_items: List[ProgressiveItem] = []
+    total_items: int = 0
+    estimated_duration: float = 0.0  # 预估总显示时长
+    complete_answer: Optional[str] = None
+    complete_recommendations: List[FormattedAnimeItem] = []
+    total_found: int = 0
+    query_time: Optional[float] = None
+    
+    class Config:
+        schema_extra = {
+            "example": {
+                "progressive_answer": True,
+                "progressive_items": [
+                    {
+                        "type": "intro",
+                        "text": "根据您的问题，我为您推荐以下治愈系动漫...",
+                        "anime": None,
+                        "delay": 0.8
+                    },
+                    {
+                        "type": "anime", 
+                        "text": "🎬《龙猫》- 温暖的成长故事...",
+                        "anime": {
+                            "title_zh": "龙猫",
+                            "cover_image": "http://localhost:8000/images/totoro.jpg"
+                        },
+                        "delay": 0.6
+                    }
+                ],
+                "total_items": 2,
+                "estimated_duration": 5.2
+            }
+        }
+
 # 增强的问答响应模型
 class EnhancedQuestionResponse(BaseModel):
     answer: str                    # AI生成的回答
@@ -343,7 +416,7 @@ async def get_simple_recommendations(request: QuestionRequest, http_request: Req
                 "uuid": item.get("uuid"),
                 "title_zh": item.get("title_zh"),
                 "title_en": item.get("title_en"),
-                "description_zh": item.get("description_zh", "")[:100] + "..." if item.get("description_zh", "") else "",
+                "description_zh": (item.get("description_zh") or "")[:100] + "..." if (item.get("description_zh") or "") else "",
                 "cover_image": item.get("cover_image"),
                 "thumbnail": item.get("thumbnail"),
                 "year": item.get("year"),
@@ -360,6 +433,194 @@ async def get_simple_recommendations(request: QuestionRequest, http_request: Req
         }
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"推荐服务出错：{str(e)}")
+
+# 流式推荐接口（打字机效果）
+@app.post("/api/recommendations/streaming", response_model=StreamingRecommendationResponse)
+async def get_streaming_recommendations(request: QuestionRequest, http_request: Request):
+    """
+    返回支持打字机效果的推荐数据
+    """
+    try:
+        base_url = f"{http_request.url.scheme}://{http_request.url.netloc}"
+        
+        # 获取完整推荐数据
+        result = await get_formatted_recommendations(
+            user_question=request.question, 
+            k=5,
+            base_url=base_url
+        )
+        
+        # 将回答文本分段处理（打字机效果）
+        answer = result["answer"]
+        answer_chunks = split_text_for_streaming(answer)
+        
+        return {
+            "stream_answer": True,
+            "answer_chunks": answer_chunks,
+            "answer_complete": answer,
+            "recommendations": result["recommendations"],
+            "total_found": result["total_found"],
+            "query_time": result["query_time"]
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"流式推荐服务出错：{str(e)}")
+
+# 渐进式流式推荐接口（文案与图片同步）
+@app.post("/api/recommendations/progressive", response_model=ProgressiveRecommendationResponse)
+async def get_progressive_recommendations(request: QuestionRequest, http_request: Request):
+    """
+    返回渐进式推荐数据：文案片段与对应的动漫同步显示
+    适合需要更强沉浸感的场景
+    """
+    try:
+        base_url = f"{http_request.url.scheme}://{http_request.url.netloc}"
+        
+        # 获取完整推荐数据
+        result = await get_formatted_recommendations(
+            user_question=request.question, 
+            k=3,  # 渐进式显示推荐较少作品，避免等待过长
+            base_url=base_url
+        )
+        
+        # 解析回答文本，提取每部动漫的描述
+        answer = result["answer"]
+        recommendations = result["recommendations"]
+        
+        # 构建渐进式数据结构
+        progressive_items = []
+        
+        # 分割回答为引言、动漫介绍段落、结语
+        answer_parts = answer.split('🎬')  # 按动漫标记分割
+        
+        # 引言部分
+        if answer_parts[0].strip():
+            progressive_items.append({
+                "type": "intro",
+                "text": answer_parts[0].strip(),
+                "anime": None,
+                "delay": 0.8  # 引言显示较慢
+            })
+        
+        # 为每部动漫创建渐进项
+        for i, anime in enumerate(recommendations):
+            # 尝试从回答中提取对应的描述
+            anime_text = ""
+            if i + 1 < len(answer_parts):
+                # 提取动漫介绍段落
+                anime_section = answer_parts[i + 1]
+                anime_text = f"🎬{anime_section.split('🎬')[0].strip()}"
+            
+            if not anime_text:
+                # 备用：生成简短介绍
+                title = anime.get('title_zh') or anime.get('name_cn', '推荐作品')
+                description = anime.get('description_zh', '一部值得观看的作品')[:50]
+                rating = anime.get('average_score') or anime.get('rating')
+                rating_text = f"评分 {rating}" if rating else ""
+                anime_text = f"🎬《{title}》- {description}... {rating_text}"
+            
+            progressive_items.append({
+                "type": "anime",
+                "text": anime_text,
+                "anime": anime,
+                "delay": 0.6  # 动漫介绍中等速度
+            })
+        
+        # 结语部分（从最后的文本提取）
+        conclusion_keywords = ["希望", "如果", "推荐", "💡", "🌸", "随时"]
+        conclusion = ""
+        for keyword in conclusion_keywords:
+            if keyword in answer:
+                conclusion_start = answer.rfind(keyword)
+                if conclusion_start > 0:
+                    conclusion = answer[conclusion_start:].strip()
+                    break
+        
+        if conclusion:
+            progressive_items.append({
+                "type": "conclusion", 
+                "text": conclusion,
+                "anime": None,
+                "delay": 0.5  # 结语显示较快
+            })
+        
+        return {
+            "progressive_answer": True,
+            "progressive_items": progressive_items,
+            "total_items": len(progressive_items),
+            "estimated_duration": sum(item["delay"] * (len(item["text"]) / 30) for item in progressive_items),  # 预估总时长
+            "complete_answer": answer,
+            "complete_recommendations": recommendations,
+            "total_found": result["total_found"],
+            "query_time": result["query_time"]
+        }
+        
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"渐进式推荐服务出错：{str(e)}")
+
+def split_text_for_streaming(text: str, chunk_size: int = 30) -> List[str]:
+    """
+    将文本分割成适合打字机效果的片段
+    优化版：更好的语义分割和渐进式体验
+    """
+    if not text:
+        return []
+    
+    chunks = []
+    current_chunk = ""
+    
+    # 多级分割策略：段落 -> 句子 -> 短语
+    # 1. 先按段落分割
+    paragraphs = text.split('\n\n')
+    
+    for paragraph in paragraphs:
+        if not paragraph.strip():
+            continue
+            
+        # 2. 按句子分割，保持语义完整
+        sentences = paragraph.replace('。', '。\n').replace('！', '！\n').replace('？', '？\n').replace('～', '～\n').split('\n')
+        
+        for sentence in sentences:
+            sentence = sentence.strip()
+            if not sentence:
+                continue
+            
+            # 3. 对长句子进一步分割
+            if len(sentence) > chunk_size * 2:
+                # 按逗号、分号等分割长句
+                sub_parts = sentence.replace('，', '，\n').replace('；', '；\n').replace('：', '：\n').split('\n')
+                for part in sub_parts:
+                    part = part.strip()
+                    if not part:
+                        continue
+                    
+                    if len(current_chunk + part) > chunk_size and current_chunk:
+                        chunks.append(current_chunk)
+                        current_chunk = part
+                    else:
+                        current_chunk += part
+            else:
+                # 正常处理短句
+                if len(current_chunk + sentence) > chunk_size and current_chunk:
+                    chunks.append(current_chunk)
+                    current_chunk = sentence
+                else:
+                    current_chunk += sentence
+    
+    # 添加最后一个chunk
+    if current_chunk:
+        chunks.append(current_chunk)
+    
+    # 后处理：确保没有太短的片段（除了最后一个）
+    optimized_chunks = []
+    for i, chunk in enumerate(chunks):
+        if i == len(chunks) - 1:  # 最后一个片段
+            optimized_chunks.append(chunk)
+        elif len(chunk) < 10 and i < len(chunks) - 1:  # 太短的片段与下一个合并
+            chunks[i + 1] = chunk + chunks[i + 1]
+        else:
+            optimized_chunks.append(chunk)
+    
+    return optimized_chunks
 
 # 单个动漫数据上传接口
 @app.post("/api/anime/upload", response_model=UploadResponse)
@@ -475,3 +736,282 @@ async def upload_image():
     图片上传接口（预留功能）
     """
     return {"message": "图片上传功能开发中，敬请期待！"}
+
+
+# ==================== 新增流式API端点 ====================
+
+@app.post("/api/recommendations/qwen-streaming")
+async def get_qwen_streaming_recommendations(request: QuestionRequest, http_request: Request):
+    """
+    基于千问大模型的真实流式推荐API
+    支持文本逐步生成和图片触发显示
+    """
+    try:
+        base_url = f"{http_request.url.scheme}://{http_request.url.netloc}"
+        
+        # 1. 获取动漫数据
+        search_result = await get_anime_streaming_data(
+            user_question=request.question,
+            k=3,
+            base_url=base_url
+        )
+        
+        # 检查搜索结果是否有效
+        if not search_result or not search_result.get("streaming_answer"):
+            error_message = search_result.get("answer", "搜索服务异常") if search_result else "搜索服务异常"
+            return {
+                "success": False,
+                "error": "向量搜索失败",
+                "message": error_message,
+                "user_question": request.question,
+                "anime_list": [],
+                "total_found": 0,
+                "query_time": search_result.get("query_time", 0) if search_result else 0,
+                "suggestion": "请检查Qdrant数据库连接或尝试重新上传动漫数据"
+            }
+        
+        # 2. 准备动漫列表和上下文
+        anime_list = search_result.get("anime_list", [])
+        if not anime_list:
+            return {
+                "success": False,
+                "error": "未找到动漫数据",
+                "message": "虽然搜索成功，但未找到相关动漫作品",
+                "user_question": request.question,
+                "anime_list": [],
+                "total_found": 0,
+                "query_time": search_result.get("query_time", 0),
+                "suggestion": "请尝试使用其他关键词或检查动漫数据库"
+            }
+        context_parts = []
+        for anime in anime_list:
+            title = anime.get('title_zh', '未知作品')
+            description = anime.get('description_zh') or ''  # 处理None值
+            if description:
+                description = description[:100]
+            context_parts.append(f"《{title}》- {description}")
+        
+        context = "\n".join(context_parts)
+        
+        return {
+            "success": True,
+            "user_question": request.question,
+            "anime_list": anime_list,
+            "context": context,
+            "total_found": search_result["total_found"],
+            "query_time": search_result["query_time"],
+            "message": "请使用 /api/recommendations/qwen-streaming-sse 获取流式文本"
+        }
+        
+    except Exception as e:
+        import traceback
+        error_trace = traceback.format_exc()
+        logger.error(f"千问流式推荐服务异常: {error_trace}")
+        raise HTTPException(status_code=500, detail=f"千问流式推荐服务出错：{str(e)} (详细错误已记录到日志)")
+
+
+@app.post("/api/recommendations/qwen-streaming-sse")
+async def get_qwen_streaming_sse(request: QuestionRequest, http_request: Request):
+    """
+    千问流式推荐 - Server-Sent Events版本
+    返回实时生成的文本流和图片触发信号
+    """
+    async def generate_streaming_response():
+        try:
+            base_url = f"{http_request.url.scheme}://{http_request.url.netloc}"
+            
+            # 1. 获取动漫数据
+            search_result = await get_anime_streaming_data(
+                user_question=request.question,
+                k=3,
+                base_url=base_url
+            )
+            
+            if not search_result or not search_result.get("streaming_answer"):
+                yield f"data: {json.dumps({'type': 'error', 'content': '未找到相关动漫作品'})}\n\n"
+                return
+            
+            # 2. 发送动漫列表
+            anime_list = search_result.get("anime_list", [])
+            if not anime_list:
+                yield f"data: {json.dumps({'type': 'error', 'content': '未找到动漫数据'})}\n\n"
+                return
+                
+            yield f"data: {json.dumps({'type': 'anime_list', 'content': anime_list})}\n\n"
+            
+            # 3. 准备上下文
+            context_parts = []
+            for anime in anime_list:
+                title = anime.get('title_zh', '未知作品')
+                description = anime.get('description_zh') or ''  # 处理None值
+                if description:
+                    description = description[:100]
+                context_parts.append(f"《{title}》- {description}")
+            
+            context = "\n".join(context_parts)
+            
+            # 4. 开始千问流式生成
+            try:
+                qwen_client = get_qwen_client()
+                async for chunk in qwen_client.generate_streaming_with_triggers(
+                    user_question=request.question,
+                    anime_list=anime_list
+                ):
+                    if chunk["type"] == "text":
+                        yield f"data: {json.dumps({'type': 'text', 'content': chunk['content']})}\n\n"
+                    elif chunk["type"] == "image_trigger":
+                        yield f"data: {json.dumps({'type': 'image_trigger', 'content': chunk['content']})}\n\n"
+                    elif chunk["type"] == "error":
+                        yield f"data: {json.dumps({'type': 'error', 'content': chunk['content']})}\n\n"
+                    
+                    # 添加小延迟确保流畅显示
+                    await asyncio.sleep(0.05)
+            
+            except RuntimeError as qwen_error:
+                # 千问API配置错误，提供降级响应
+                fallback_text = f"🎌 根据您的问题「{request.question}」，为您找到了 {len(anime_list)} 部相关动漫作品：\n\n"
+                for i, anime in enumerate(anime_list):
+                    title = anime.get('title_zh', '未知作品')
+                    fallback_text += f"{i+1}. 《{title}》\n"
+                
+                fallback_text += f"\n⚠️ AI文案生成功能暂时不可用（{qwen_error}），但动漫推荐数据已为您准备完成。"
+                
+                # 逐字符发送降级响应
+                for char in fallback_text:
+                    yield f"data: {json.dumps({'type': 'text', 'content': char})}\n\n"
+                    await asyncio.sleep(0.03)
+            
+            # 5. 发送完成信号
+            yield f"data: {json.dumps({'type': 'complete', 'content': 'done'})}\n\n"
+            
+        except Exception as e:
+            yield f"data: {json.dumps({'type': 'error', 'content': f'流式生成错误: {str(e)}'})}\n\n"
+    
+    return StreamingResponse(
+        generate_streaming_response(),
+        media_type="text/plain",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "Access-Control-Allow-Origin": "*",
+            "Access-Control-Allow-Headers": "*",
+        }
+    )
+
+
+# 流式推荐状态模型
+class StreamingRecommendationRequest(BaseModel):
+    question: str
+    enable_image_triggers: bool = True
+    max_recommendations: int = 3
+
+@app.post("/api/recommendations/realtime-streaming")
+async def get_realtime_streaming_recommendations(request: StreamingRecommendationRequest, http_request: Request):
+    """
+    实时流式推荐API - 完整版
+    支持文本渐进生成 + 图片触发同步显示
+    """
+    async def generate_realtime_stream():
+        try:
+            base_url = f"{http_request.url.scheme}://{http_request.url.netloc}"
+            
+            # 发送开始信号
+            yield f"data: {json.dumps({'type': 'start', 'message': '开始处理您的请求...'})}\n\n"
+            
+            # 1. 向量检索阶段
+            yield f"data: {json.dumps({'type': 'status', 'message': '正在搜索相关动漫...'})}\n\n"
+            
+            search_result = await get_anime_streaming_data(
+                user_question=request.question,
+                k=request.max_recommendations,
+                base_url=base_url
+            )
+            
+            if not search_result or not search_result.get("streaming_answer"):
+                yield f"data: {json.dumps({'type': 'error', 'content': '未找到相关动漫作品'})}\n\n"
+                return
+            
+            # 2. 发送搜索结果
+            anime_list = search_result.get("anime_list", [])
+            if not anime_list:
+                yield f"data: {json.dumps({'type': 'error', 'content': '搜索成功但未找到相关动漫作品'})}\n\n"
+                return
+                
+            yield f"data: {json.dumps({'type': 'search_results', 'anime_list': anime_list, 'total_found': len(anime_list)})}\n\n"
+            
+            # 3. 开始AI文案生成
+            yield f"data: {json.dumps({'type': 'status', 'message': '正在生成推荐文案...'})}\n\n"
+            
+            # 准备上下文
+            context_parts = []
+            for anime in anime_list:
+                title = anime.get('title_zh', '未知作品')
+                description = anime.get('description_zh') or ''  # 处理None值
+                if description:
+                    description = description[:100]
+                context_parts.append(f"《{title}》- {description}")
+            
+            context = "\n".join(context_parts)
+            
+            # 4. 千问流式生成
+            try:
+                qwen_client = get_qwen_client()
+                text_buffer = ""
+                
+                async for chunk in qwen_client.generate_streaming_with_triggers(
+                    user_question=request.question,
+                    anime_list=anime_list
+                ):
+                    if chunk["type"] == "text":
+                        text_content = chunk["content"]
+                        text_buffer += text_content
+                        yield f"data: {json.dumps({'type': 'text_chunk', 'content': text_content, 'buffer': text_buffer})}\n\n"
+                        
+                    elif chunk["type"] == "image_trigger" and request.enable_image_triggers:
+                        trigger_data = chunk["content"]
+                        yield f"data: {json.dumps({'type': 'image_trigger', 'anime_uuid': trigger_data.get('anime_uuid'), 'trigger_text': trigger_data.get('trigger_text')})}\n\n"
+                        
+                    elif chunk["type"] == "error":
+                        yield f"data: {json.dumps({'type': 'warning', 'content': f'生成警告: {chunk.content}'})}\n\n"
+                    
+                    # 流控制
+                    await asyncio.sleep(0.03)
+                
+            except RuntimeError as qwen_error:
+                # 千问API配置错误，使用降级方案
+                yield f"data: {json.dumps({'type': 'status', 'message': 'AI文案生成不可用，使用简化推荐'})}\n\n"
+                
+                text_buffer = f"🎌 根据您的问题「{request.question}」，为您推荐以下动漫：\n\n"
+                for i, anime in enumerate(anime_list):
+                    title = anime.get('title_zh', '未知作品')
+                    desc = anime.get('description_zh', '')[:50]
+                    recommendation = f"{i+1}. 《{title}》- {desc}\n"
+                    text_buffer += recommendation
+                    
+                    # 逐字符发送
+                    for char in recommendation:
+                        yield f"data: {json.dumps({'type': 'text_chunk', 'content': char, 'buffer': text_buffer})}\n\n"
+                        await asyncio.sleep(0.02)
+                    
+                    # 发送图片触发（如果启用）
+                    if request.enable_image_triggers:
+                        yield f"data: {json.dumps({'type': 'image_trigger', 'anime_uuid': anime.get('uuid', f'fallback-{i}'), 'trigger_text': f'《{title}》'})}\n\n"
+                
+                text_buffer += f"\n⚠️ 注意：AI文案生成功能需要配置千问API密钥"
+            
+            # 5. 完成信号
+            yield f"data: {json.dumps({'type': 'complete', 'final_text': text_buffer, 'total_anime': len(anime_list)})}\n\n"
+            
+        except Exception as e:
+            yield f"data: {json.dumps({'type': 'error', 'content': f'实时流式推荐错误: {str(e)}'})}\n\n"
+    
+    return StreamingResponse(
+        generate_realtime_stream(),
+        media_type="text/plain",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "Access-Control-Allow-Origin": "*",
+            "Access-Control-Allow-Headers": "*",
+        }
+    )

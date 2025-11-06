@@ -286,7 +286,8 @@ async def get_formatted_recommendations(user_question: str, k: int = 3, base_url
             
             # 为AI回答构建上下文
             title = formatted_item.get('title_zh') or formatted_item.get('name_cn', '未知作品')
-            description = formatted_item.get('description_zh', '暂无简介')[:100]
+            description = formatted_item.get('description_zh') or '暂无简介'
+            description = description[:100] if description else '暂无简介'
             context_parts.append(f"《{title}》- {description}...")
         
         # 3. 生成AI回答
@@ -316,6 +317,88 @@ async def get_formatted_recommendations(user_question: str, k: int = 3, base_url
         logger.exception("get_formatted_recommendations 执行异常:")
         return {
             "answer": f"查询过程中出现错误: {str(e)}",
+            "recommendations": [],
+            "total_found": 0,
+            "query_time": round(time.time() - start_time, 3)
+        }
+
+
+async def get_streaming_recommendations(user_question: str, k: int = 3, base_url: str = "") -> dict:
+    """
+    返回流式推荐数据，支持实时文案生成和图片触发
+    """
+    import time
+    start_time = time.time()
+    
+    try:
+        # 1. 向量检索阶段
+        logger.info(f"开始流式推荐查询: {user_question}")
+        
+        # 生成查询向量
+        query_embedding = get_embedding(user_question)
+        
+        # 执行向量搜索
+        search_results = client.search(
+            collection_name=collection_name,
+            query_vector=query_embedding,
+            limit=k,
+            score_threshold=0.3
+        )
+        
+        if not search_results:
+            return {
+                "streaming_answer": False,
+                "answer": f"抱歉，没有找到与「{user_question}」相关的动漫作品。",
+                "recommendations": [],
+                "total_found": 0,
+                "query_time": round(time.time() - start_time, 3)
+            }
+        
+        # 2. 准备动漫列表数据
+        anime_list = []
+        for result in search_results:
+            anime = result.payload
+            score = result.score
+            
+            # 构建图片链接
+            def build_image_url(relative_path: str) -> str:
+                if not relative_path:
+                    return None
+                if relative_path.startswith('http'):
+                    return relative_path
+                return f"{base_url.rstrip('/')}{relative_path}" if base_url else relative_path
+            
+            cover_image = None
+            if anime.get('image_medium'):
+                cover_image = build_image_url(anime['image_medium'])
+            elif anime.get('cover_url'):
+                cover_image = anime['cover_url']
+            
+            anime_data = {
+                "uuid": anime.get('uuid') or anime.get('id'),
+                "title_zh": anime.get('title_zh') or anime.get('name_cn'),
+                "description_zh": anime.get('description_zh') or anime.get('description'),
+                "cover_image": cover_image,
+                "average_score": anime.get('average_score') or anime.get('rating'),
+                "match_score": round(score, 3)
+            }
+            anime_list.append(anime_data)
+        
+        query_time = round(time.time() - start_time, 3)
+        
+        return {
+            "streaming_answer": True,
+            "anime_list": anime_list,
+            "total_found": len(anime_list),
+            "query_time": query_time,
+            "user_question": user_question
+        }
+        
+    except Exception as e:
+        logger.exception("get_streaming_recommendations 执行异常:")
+        return {
+            "streaming_answer": False,
+            "answer": f"流式查询过程中出现错误: {str(e)}",
             "recommendations": [],
             "total_found": 0,
             "query_time": round(time.time() - start_time, 3)
