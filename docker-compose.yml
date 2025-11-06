@@ -16,7 +16,7 @@ services:
   #     - TZ=Asia/Shanghai  # ✅ 设置时区为东八区
   #   restart: unless-stopped
   #   networks:
-  #     - gongzhonghao-network
+  #     - anime-network
 
   qdrant:  # 向量数据库
     image: qdrant/qdrant:latest
@@ -36,7 +36,7 @@ services:
       timeout: 3s
       retries: 3
     networks:
-      - gongzhonghao-network
+      - anime-network
 
   langchain_agent:
     env_file: .env
@@ -46,12 +46,17 @@ services:
     container_name: langchain_agent
     volumes:
       - ./langchain_agent:/app  # 挂载本地项目目录到容器的 /app
+      - ./langchain_agent/models_cache:/app/models_cache  # 挂载模型缓存目录
     ports:
       - "8000:8000" 
+    environment:
+      - HF_HOME=/app/models_cache
+      - HF_DATASETS_CACHE=/app/models_cache
+      - TOKENIZERS_PARALLELISM=false
     networks:
-      - gongzhonghao-network
+      - anime-network
     restart: unless-stopped
 
 networks:
-  gongzhonghao-network:
+  anime-network:
     driver: bridge

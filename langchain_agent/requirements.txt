@@ -1,11 +1,8 @@
 fastapi
 uvicorn
-langchain_community
-langchain_qdrant
 qdrant-client
 sentence-transformers
 huggingface-hub
-langchain
-langchain-huggingface
-langchain-ollama
-langchain-alibabacloud
+httpx
+pydantic
+dashscope
